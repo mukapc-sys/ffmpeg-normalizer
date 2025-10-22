@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ffmpeg-normalizer
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: FFMPEG_API_KEY
+        generateValue: true
+    healthCheckPath: /health
