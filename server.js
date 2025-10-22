@@ -1,140 +1,181 @@
 const express = require('express');
-const fetch = require('node-fetch');
+const multer = require('multer');
 const { exec } = require('child_process');
 const { promisify } = require('util');
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const os = require('os');
 
 const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '50mb' }));
-
 // CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
   next();
 });
 
-// Auth middleware
-const authenticate = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== process.env.FFMPEG_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-};
+app.use(express.json());
 
-// R2 Client
-const r2Client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
+// Configurar multer para upload
+const upload = multer({
+  dest: '/tmp/uploads/',
+  limits: { fileSize: 500 * 1024 * 1024 } // 500MB
 });
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'video-normalizer'
+  });
 });
 
-// Download video
-async function downloadVideo(url, outputPath) {
-  console.log(`📥 Downloading: ${url}`);
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
-  
-  const buffer = await response.buffer();
-  fs.writeFileSync(outputPath, buffer);
-  console.log(`✅ Downloaded: ${outputPath}`);
-  return outputPath;
-}
-
-// Upload to R2
-async function uploadToR2(filePath, filename) {
-  console.log(`📤 Uploading to R2: ${filename}`);
-  
-  const fileContent = fs.readFileSync(filePath);
-  const key = `normalized/${filename}`;
-
-  await r2Client.send(
-    new PutObjectCommand({
-      Bucket: 'editora-de-conteudo',
-      Key: key,
-      Body: fileContent,
-      ContentType: 'video/mp4',
-    })
-  );
-
-  const publicUrl = `https://pub-4bc62c024eb4440b996ad3595b1c3d88.r2.dev/${key}`;
-  console.log(`✅ Uploaded to R2: ${publicUrl}`);
-  return publicUrl;
-}
-
-// Normalize video
-app.post('/normalize', authenticate, async (req, res) => {
-  const { videoUrl } = req.body;
-  
-  if (!videoUrl) {
-    return res.status(400).json({ error: 'videoUrl is required' });
-  }
-
-  const timestamp = Date.now();
-  const inputPath = `/tmp/input_${timestamp}.mp4`;
-  const outputPath = `/tmp/normalized_${timestamp}.mp4`;
-
+// Diagnostics
+app.get('/diagnostics', async (req, res) => {
   try {
-    console.log(`🎬 Starting normalization: ${videoUrl}`);
+    const { stdout: ffmpegVersion } = await execAsync('ffmpeg -version');
+    const memUsage = process.memoryUsage();
+    const uptime = process.uptime();
 
-    // Download
-    await downloadVideo(videoUrl, inputPath);
-
-    // Normalize
-    const ffmpegCmd = `
-      ffmpeg -i ${inputPath} \
-        -af "asetpts=PTS-STARTPTS" \
-        -vf "setpts=PTS-STARTPTS" \
-        -r 30 \
-        -c:v libx264 -preset medium -crf 23 \
-        -c:a aac -b:a 128k -ar 48000 -ac 2 \
-        -vsync cfr \
-        -async 1 \
-        -avoid_negative_ts make_zero \
-        -movflags +faststart \
-        -y ${outputPath}
-    `.replace(/\n/g, ' ').trim();
-
-    console.log(`🔧 Normalizing video...`);
-    await execAsync(ffmpegCmd);
-    console.log(`✅ Video normalized`);
-
-    // Upload to R2
-    const normalizedUrl = await uploadToR2(outputPath, `normalized_${timestamp}.mp4`);
-
-    // Cleanup
-    fs.unlinkSync(inputPath);
-    fs.unlinkSync(outputPath);
-
-    res.json({ success: true, videoUrl: normalizedUrl });
-
+    res.json({
+      status: 'ok',
+      ffmpeg: ffmpegVersion.split('\n')[0],
+      memory: {
+        rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`,
+        heapUsed: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
+        heapTotal: `${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`
+      },
+      uptime: `${Math.round(uptime)}s`,
+      tmpDir: os.tmpdir()
+    });
   } catch (error) {
-    console.error('❌ Normalization error:', error);
-    
-    // Cleanup on error
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🎬 FFmpeg Normalizer Server running on port ${PORT}`);
+// Endpoint principal de normalização
+app.post('/normalize', upload.single('video'), async (req, res) => {
+  const startTime = Date.now();
+  let inputPath = null;
+  let outputPath = null;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video file provided' });
+    }
+
+    inputPath = req.file.path;
+    outputPath = path.join('/tmp', `normalized_${Date.now()}_${req.file.originalname}`);
+
+    console.log(`📥 Normalizando vídeo: ${req.file.originalname}`);
+    console.log(`📏 Tamanho original: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`);
+
+    // Obter informações do vídeo
+    const { stdout: probeOutput } = await execAsync(
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name,r_frame_rate -of json "${inputPath}"`
+    );
+    const videoInfo = JSON.parse(probeOutput);
+    const stream = videoInfo.streams[0];
+
+    console.log(`📊 Codec: ${stream.codec_name}, Resolução: ${stream.width}x${stream.height}`);
+
+    // Parâmetros de normalização
+    const targetWidth = parseInt(req.body.targetWidth) || 1080;
+    const targetHeight = parseInt(req.body.targetHeight) || 1920;
+    const targetFormat = req.body.targetFormat || '9:16';
+    const quality = req.body.quality || 'medium';
+
+    // Configurações de qualidade
+    const qualityPresets = {
+      low: { crf: 28, preset: 'veryfast' },
+      medium: { crf: 23, preset: 'medium' },
+      high: { crf: 18, preset: 'slow' }
+    };
+
+    const { crf, preset } = qualityPresets[quality] || qualityPresets.medium;
+
+    // Comando FFmpeg para normalização
+    // Garante dimensões pares, converte para H.264, AAC, normaliza áudio
+    const ffmpegCmd = `ffmpeg -i "${inputPath}" \
+      -vf "scale='trunc(${targetWidth}/2)*2':'trunc(${targetHeight}/2)*2',setsar=1" \
+      -c:v libx264 -preset ${preset} -crf ${crf} \
+      -c:a aac -b:a 128k -ar 44100 -ac 2 \
+      -af "loudnorm=I=-16:LRA=11:TP=-1.5" \
+      -movflags +faststart \
+      -pix_fmt yuv420p \
+      -r 30 \
+      -y "${outputPath}"`;
+
+    console.log(`⚙️ Executando normalização (qualidade: ${quality})...`);
+    await execAsync(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
+
+    // Ler arquivo normalizado
+    const normalizedVideo = await fs.readFile(outputPath);
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
+
+    console.log(`✅ Normalização completa em ${processingTime}s`);
+    console.log(`📏 Tamanho final: ${(normalizedVideo.length / 1024 / 1024).toFixed(2)}MB`);
+
+    // Enviar vídeo normalizado
+    res.set({
+      'Content-Type': 'video/mp4',
+      'Content-Length': normalizedVideo.length,
+      'X-Processing-Time': processingTime
+    });
+    res.send(normalizedVideo);
+
+  } catch (error) {
+    console.error('❌ Erro na normalização:', error);
+    res.status(500).json({
+      error: 'Normalization failed',
+      message: error.message,
+      details: error.stderr || error.stdout
+    });
+  } finally {
+    // Limpar arquivos temporários
+    try {
+      if (inputPath) await fs.unlink(inputPath).catch(() => {});
+      if (outputPath) await fs.unlink(outputPath).catch(() => {});
+    } catch (e) {
+      console.error('Erro ao limpar arquivos:', e);
+    }
+  }
+});
+
+// Limpeza periódica do /tmp
+setInterval(async () => {
+  try {
+    const tmpFiles = await fs.readdir('/tmp');
+    const now = Date.now();
+    const maxAge = 60 * 60 * 1000; // 1 hora
+
+    for (const file of tmpFiles) {
+      if (file.startsWith('normalized_') || file.startsWith('upload_')) {
+        const filePath = path.join('/tmp', file);
+        const stats = await fs.stat(filePath);
+        if (now - stats.mtimeMs > maxAge) {
+          await fs.unlink(filePath);
+          console.log(`🗑️ Arquivo antigo removido: ${file}`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Erro na limpeza:', error);
+  }
+}, 30 * 60 * 1000); // A cada 30 minutos
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🎬 Video Normalizer Server running on port ${PORT}`);
+  console.log(`📍 Endpoints disponíveis:`);
+  console.log(`   GET  /health - Health check`);
+  console.log(`   GET  /diagnostics - System diagnostics`);
+  console.log(`   POST /normalize - Normalize video`);
 });
