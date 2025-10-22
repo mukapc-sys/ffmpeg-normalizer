@@ -1,7 +1,3 @@
----
-
-## 📄 **server.js**
-```javascript
 const express = require('express');
 const fetch = require('node-fetch');
 const { exec } = require('child_process');
