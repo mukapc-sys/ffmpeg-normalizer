@@ -4,7 +4,7 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
-const FormData = require('form-data');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const execAsync = promisify(exec);
 const app = express();
@@ -30,6 +30,16 @@ const authenticate = (req, res, next) => {
   next();
 };
 
+// R2 Client
+const r2Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -51,26 +61,21 @@ async function downloadVideo(url, outputPath) {
 async function uploadToR2(filePath, filename) {
   console.log(`📤 Uploading to R2: ${filename}`);
   
-  const form = new FormData();
-  form.append('file', fs.createReadStream(filePath));
-  form.append('filename', filename);
-  form.append('path', 'normalized/');
+  const fileContent = fs.readFileSync(filePath);
+  const key = `normalized/${filename}`;
 
-  const uploadResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/r2-upload`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`
-    },
-    body: form
-  });
+  await r2Client.send(
+    new PutObjectCommand({
+      Bucket: 'editora-de-conteudo',
+      Key: key,
+      Body: fileContent,
+      ContentType: 'video/mp4',
+    })
+  );
 
-  if (!uploadResponse.ok) {
-    throw new Error(`R2 upload failed: ${await uploadResponse.text()}`);
-  }
-
-  const { signedUrl } = await uploadResponse.json();
-  console.log(`✅ Uploaded to R2`);
-  return signedUrl;
+  const publicUrl = `https://pub-4bc62c024eb4440b996ad3595b1c3d88.r2.dev/${key}`;
+  console.log(`✅ Uploaded to R2: ${publicUrl}`);
+  return publicUrl;
 }
 
 // Normalize video
