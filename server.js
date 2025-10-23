@@ -93,25 +93,25 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
     const targetFormat = req.body.targetFormat || '9:16';
     const quality = req.body.quality || 'medium';
 
-    // Configurações de qualidade
+    // Configurações de qualidade otimizadas para velocidade
     const qualityPresets = {
-      low: { crf: 28, preset: 'veryfast' },
-      medium: { crf: 23, preset: 'medium' },
-      high: { crf: 18, preset: 'slow' }
+      low: { crf: 28, preset: 'ultrafast' },
+      medium: { crf: 23, preset: 'veryfast' },  // Mudou de medium para veryfast
+      high: { crf: 20, preset: 'fast' }  // Mudou de slow para fast
     };
 
     const { crf, preset } = qualityPresets[quality] || qualityPresets.medium;
 
-    // Comando FFmpeg para normalização
-    // Garante dimensões pares, converte para H.264, AAC, normaliza áudio
+    // Comando FFmpeg otimizado para velocidade
+    // Remove loudnorm (muito lento) e usa configurações mais rápidas
     const ffmpegCmd = `ffmpeg -i "${inputPath}" \
       -vf "scale='trunc(${targetWidth}/2)*2':'trunc(${targetHeight}/2)*2',setsar=1" \
-      -c:v libx264 -preset ${preset} -crf ${crf} \
+      -c:v libx264 -preset ${preset} -crf ${crf} -tune fastdecode \
       -c:a aac -b:a 128k -ar 44100 -ac 2 \
-      -af "loudnorm=I=-16:LRA=11:TP=-1.5" \
       -movflags +faststart \
       -pix_fmt yuv420p \
       -r 30 \
+      -threads 0 \
       -y "${outputPath}"`;
 
     console.log(`⚙️ Executando normalização (qualidade: ${quality})...`);
