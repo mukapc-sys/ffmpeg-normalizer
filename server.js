@@ -102,15 +102,17 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
 
     const { crf, preset } = qualityPresets[quality] || qualityPresets.medium;
 
-    // Comando FFmpeg otimizado para velocidade
-    // Remove loudnorm (muito lento) e usa configurações mais rápidas
+    // Comando FFmpeg otimizado para velocidade E sincronização
+    // CRÍTICO: Não forçar framerate e manter sincronização de áudio
     const ffmpegCmd = `ffmpeg -i "${inputPath}" \
       -vf "scale='trunc(${targetWidth}/2)*2':'trunc(${targetHeight}/2)*2',setsar=1" \
       -c:v libx264 -preset ${preset} -crf ${crf} -tune fastdecode \
       -c:a aac -b:a 128k -ar 44100 -ac 2 \
+      -af "aresample=async=1" \
       -movflags +faststart \
       -pix_fmt yuv420p \
-      -r 30 \
+      -vsync 2 \
+      -async 1 \
       -threads 0 \
       -y "${outputPath}"`;
 
