@@ -10,26 +10,13 @@ const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
 app.use(express.json());
 
-// Configurar multer para upload
 const upload = multer({
   dest: '/tmp/uploads/',
-  limits: { fileSize: 500 * 1024 * 1024 } // 500MB
+  limits: { fileSize: 500 * 1024 * 1024 }
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -38,7 +25,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Diagnostics
 app.get('/diagnostics', async (req, res) => {
   try {
     const { stdout: ffmpegVersion } = await execAsync('ffmpeg -version');
@@ -61,7 +47,6 @@ app.get('/diagnostics', async (req, res) => {
   }
 });
 
-// Endpoint principal de normalização
 app.post('/normalize', upload.single('video'), async (req, res) => {
   const startTime = Date.now();
   let inputPath = null;
@@ -75,39 +60,34 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
     inputPath = req.file.path;
     outputPath = path.join('/tmp', `normalized_${Date.now()}_${req.file.originalname}`);
 
-    console.log(`📥 Normalizando vídeo: ${req.file.originalname}`);
-    console.log(`📏 Tamanho original: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`);
+    console.log(`📥 Normalizando: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)}MB)`);
 
-    // Obter informações do vídeo
     const { stdout: probeOutput } = await execAsync(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name,r_frame_rate -of json "${inputPath}"`
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name -of json "${inputPath}"`
     );
     const videoInfo = JSON.parse(probeOutput);
     const stream = videoInfo.streams[0];
 
-    console.log(`📊 Codec: ${stream.codec_name}, Resolução: ${stream.width}x${stream.height}`);
+    console.log(`📊 ${stream.codec_name}, ${stream.width}x${stream.height}`);
 
-    // Parâmetros de normalização
     const targetWidth = parseInt(req.body.targetWidth) || 1080;
     const targetHeight = parseInt(req.body.targetHeight) || 1920;
-    const targetFormat = req.body.targetFormat || '9:16';
     const quality = req.body.quality || 'medium';
 
-    // Configurações de qualidade otimizadas para velocidade
     const qualityPresets = {
-      low: { crf: 28, preset: 'ultrafast' },
-      medium: { crf: 23, preset: 'veryfast' },  // Mudou de medium para veryfast
-      high: { crf: 20, preset: 'fast' }  // Mudou de slow para fast
+      low: { crf: 28, preset: 'veryfast' },
+      medium: { crf: 23, preset: 'medium' },
+      high: { crf: 18, preset: 'slow' }
     };
 
     const { crf, preset } = qualityPresets[quality] || qualityPresets.medium;
 
     // CRÍTICO: Usar vsync cfr + avoid_negative_ts + genpts para sincronização perfeita
-    // Padronizar em 30fps para concatenação sem dessincronia A/V
+    // Esses parâmetros garantem que o vídeo normalizado se concatene sem problemas de A/V sync
     const ffmpegCmd = `ffmpeg -i "${inputPath}" \
       -vf "scale='trunc(${targetWidth}/2)*2':'trunc(${targetHeight}/2)*2',setsar=1" \
       -r 30 \
-      -c:v libx264 -preset ${preset} -crf ${crf} -tune fastdecode \
+      -c:v libx264 -preset ${preset} -crf ${crf} \
       -c:a aac -b:a 128k -ar 44100 -ac 2 \
       -af "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=async=1" \
       -movflags +faststart \
@@ -116,20 +96,16 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
       -async 1 \
       -avoid_negative_ts make_zero \
       -fflags +genpts \
-      -threads 0 \
       -y "${outputPath}"`;
 
-    console.log(`⚙️ Executando normalização (qualidade: ${quality})...`);
+    console.log(`⚙️ Normalizando (${quality})...`);
     await execAsync(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
 
-    // Ler arquivo normalizado
     const normalizedVideo = await fs.readFile(outputPath);
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
 
-    console.log(`✅ Normalização completa em ${processingTime}s`);
-    console.log(`📏 Tamanho final: ${(normalizedVideo.length / 1024 / 1024).toFixed(2)}MB`);
+    console.log(`✅ Completo em ${processingTime}s (${(normalizedVideo.length / 1024 / 1024).toFixed(2)}MB)`);
 
-    // Enviar vídeo normalizado
     res.set({
       'Content-Type': 'video/mp4',
       'Content-Length': normalizedVideo.length,
@@ -138,29 +114,24 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
     res.send(normalizedVideo);
 
   } catch (error) {
-    console.error('❌ Erro na normalização:', error);
+    console.error('❌ Erro:', error);
     res.status(500).json({
       error: 'Normalization failed',
-      message: error.message,
-      details: error.stderr || error.stdout
+      message: error.message
     });
   } finally {
-    // Limpar arquivos temporários
     try {
       if (inputPath) await fs.unlink(inputPath).catch(() => {});
       if (outputPath) await fs.unlink(outputPath).catch(() => {});
-    } catch (e) {
-      console.error('Erro ao limpar arquivos:', e);
-    }
+    } catch (e) {}
   }
 });
 
-// Limpeza periódica do /tmp
 setInterval(async () => {
   try {
     const tmpFiles = await fs.readdir('/tmp');
     const now = Date.now();
-    const maxAge = 60 * 60 * 1000; // 1 hora
+    const maxAge = 60 * 60 * 1000;
 
     for (const file of tmpFiles) {
       if (file.startsWith('normalized_') || file.startsWith('upload_')) {
@@ -168,19 +139,13 @@ setInterval(async () => {
         const stats = await fs.stat(filePath);
         if (now - stats.mtimeMs > maxAge) {
           await fs.unlink(filePath);
-          console.log(`🗑️ Arquivo antigo removido: ${file}`);
+          console.log(`🗑️ Removido: ${file}`);
         }
       }
     }
-  } catch (error) {
-    console.error('Erro na limpeza:', error);
-  }
-}, 30 * 60 * 1000); // A cada 30 minutos
+  } catch (error) {}
+}, 30 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🎬 Video Normalizer Server running on port ${PORT}`);
-  console.log(`📍 Endpoints disponíveis:`);
-  console.log(`   GET  /health - Health check`);
-  console.log(`   GET  /diagnostics - System diagnostics`);
-  console.log(`   POST /normalize - Normalize video`);
+  console.log(`🎬 Video Normalizer running on port ${PORT}`);
 });
