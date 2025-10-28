@@ -140,7 +140,8 @@ setInterval(
       const maxAge = 60 * 60 * 1000;
 
       for (const file of tmpFiles) {
-        if (file.startsWith("normalized_") || file.startsWith("upload_") || file.startsWith("remuxed_")) { // 🔧 RE-MUX FIX ADICIONADO
+        if (file.startsWith("normalized_") || file.startsWith("upload_") || file.startsWith("remuxed_")) {
+          // 🔧 RE-MUX FIX ADICIONADO
           const filePath = path.join("/tmp", file);
           const stats = await fs.stat(filePath);
           if (now - stats.mtimeMs > maxAge) {
