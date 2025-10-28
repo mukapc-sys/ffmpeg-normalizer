@@ -92,7 +92,8 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
       -movflags +faststart \
       -pix_fmt yuv420p \
       -vsync cfr \
-      -async 1 \
+      -start_at_zero \
+      -copytb 1 \
       -avoid_negative_ts make_zero \
       -fflags +genpts \
       -y "${outputPath}"`;
