@@ -51,7 +51,6 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
   const startTime = Date.now();
   let inputPath = null;
   let outputPath = null;
-  let fixedPath = null; // 🔧 RE-MUX FIX ADICIONADO
 
   try {
     if (!req.file) {
@@ -60,7 +59,6 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
 
     inputPath = req.file.path;
     outputPath = path.join("/tmp", `normalized_${Date.now()}_${req.file.originalname}`);
-    fixedPath = path.join("/tmp", `remuxed_${Date.now()}_${req.file.originalname}`); // 🔧 RE-MUX FIX ADICIONADO
 
     console.log(`📥 Normalizando: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)}MB)`);
 
@@ -101,12 +99,7 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
     console.log(`⚙️ Normalizando (${quality})...`);
     await execAsync(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
 
-    // 🔧 RE-MUX FIX ADICIONADO
-    console.log(`🔧 Aplicando re-mux fix para corrigir timestamps e PTS...`);
-    const remuxCmd = `ffmpeg -y -i "${outputPath}" -c copy -fflags +genpts -vsync cfr -avoid_negative_ts make_zero -movflags +faststart "${fixedPath}"`;
-    await execAsync(remuxCmd, { maxBuffer: 50 * 1024 * 1024 });
-
-    const normalizedVideo = await fs.readFile(fixedPath);
+    const normalizedVideo = await fs.readFile(outputPath);
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
 
     console.log(`✅ Completo em ${processingTime}s (${(normalizedVideo.length / 1024 / 1024).toFixed(2)}MB)`);
@@ -127,7 +120,6 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
     try {
       if (inputPath) await fs.unlink(inputPath).catch(() => {});
       if (outputPath) await fs.unlink(outputPath).catch(() => {});
-      if (fixedPath) await fs.unlink(fixedPath).catch(() => {}); // 🔧 RE-MUX FIX ADICIONADO
     } catch (e) {}
   }
 });
@@ -140,8 +132,7 @@ setInterval(
       const maxAge = 60 * 60 * 1000;
 
       for (const file of tmpFiles) {
-        if (file.startsWith("normalized_") || file.startsWith("upload_") || file.startsWith("remuxed_")) {
-          // 🔧 RE-MUX FIX ADICIONADO
+        if (file.startsWith("normalized_") || file.startsWith("upload_")) {
           const filePath = path.join("/tmp", file);
           const stats = await fs.stat(filePath);
           if (now - stats.mtimeMs > maxAge) {
