@@ -82,12 +82,13 @@ app.post("/normalize", upload.single("video"), async (req, res) => {
 
     const { crf, preset } = qualityPresets[quality] || qualityPresets.medium;
 
+    // 🔧 CORREÇÃO: Parâmetros de áudio ajustados para garantir A/V sync perfeito
     const ffmpegCmd = `ffmpeg -i "${inputPath}" \
       -vf "scale='trunc(${targetWidth}/2)*2':'trunc(${targetHeight}/2)*2',setsar=1" \
       -r 30 \
       -c:v libx264 -preset ${preset} -crf ${crf} \
       -c:a aac -b:a 128k -ar 44100 -ac 2 \
-      -af "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=async=1" \
+      -af "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=async=1:first_pts=0" \
       -movflags +faststart \
       -pix_fmt yuv420p \
       -vsync cfr \
