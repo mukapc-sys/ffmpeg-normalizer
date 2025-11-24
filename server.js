@@ -458,8 +458,9 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     // Notificar via webhook
     if (notificationWebhook) {
       console.log('📧 [ZIP] Enviando notificação...');
+      console.log('📧 [ZIP] Webhook URL:', notificationWebhook);
       try {
-        await fetch(notificationWebhook, {
+        const notifyResponse = await fetch(notificationWebhook, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -472,10 +473,19 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
             processingTimeMs: Date.now() - startTime
           })
         });
-        console.log('✅ [ZIP] Notificação enviada');
+        
+        if (!notifyResponse.ok) {
+          const errorText = await notifyResponse.text();
+          console.error('❌ [ZIP] Notificação falhou:', notifyResponse.status, errorText);
+        } else {
+          const notifyData = await notifyResponse.json();
+          console.log('✅ [ZIP] Notificação enviada com sucesso:', notifyData);
+        }
       } catch (notifyError) {
-        console.error('❌ [ZIP] Erro ao notificar:', notifyError);
+        console.error('❌ [ZIP] Erro ao notificar:', notifyError.message);
       }
+    } else {
+      console.warn('⚠️ [ZIP] notificationWebhook não fornecido');
     }
 
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
