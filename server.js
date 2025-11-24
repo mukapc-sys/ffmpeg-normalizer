@@ -35,6 +35,72 @@ async function generateR2SignedUrl(accountId, accessKeyId, secretAccessKey, buck
   return `https://${host}${canonicalUri}`;
 }
 
+// Função auxiliar para baixar vídeo com timeout
+async function downloadVideoWithTimeout(url, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Download timeout'));
+    }, timeoutMs);
+
+    const protocol = url.startsWith('https') ? https : http;
+    
+    protocol.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        clearTimeout(timeout);
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => {
+        clearTimeout(timeout);
+        resolve(Buffer.concat(chunks));
+      });
+      response.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    }).on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+}
+
+// Função para processar vídeos em lotes paralelos
+async function processBatch(videos, batchSize = 5) {
+  const results = [];
+  
+  for (let i = 0; i < videos.length; i += batchSize) {
+    const batch = videos.slice(i, i + batchSize);
+    console.log(`📦 [ZIP] Processando lote ${Math.floor(i / batchSize) + 1}/${Math.ceil(videos.length / batchSize)} (${batch.length} vídeos)`);
+    
+    const batchResults = await Promise.all(
+      batch.map(async (video, index) => {
+        try {
+          const globalIndex = i + index;
+          console.log(`📥 [ZIP] Baixando ${globalIndex + 1}/${videos.length}: ${video.filename}`);
+          
+          const buffer = await downloadVideoWithTimeout(video.r2SignedUrl);
+          const cleanFilename = video.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+          
+          console.log(`✅ [ZIP] Baixado: ${cleanFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+          
+          return { filename: cleanFilename, buffer };
+        } catch (error) {
+          console.error(`❌ [ZIP] Erro ao baixar ${video.filename}:`, error.message);
+          throw new Error(`Falha ao baixar vídeo: ${video.filename}`);
+        }
+      })
+    );
+    
+    results.push(...batchResults);
+  }
+  
+  return results;
+}
+
 router.post('/generate-zip', express.json({ limit: '10mb' }), async (req, res) => {
   const startTime = Date.now();
   
@@ -56,51 +122,27 @@ router.post('/generate-zip', express.json({ limit: '10mb' }), async (req, res) =
 
     console.log(`📦 [ZIP] Projeto: ${projectId}, Vídeos: ${videos.length}`);
 
-    // Criar ZIP em memória
+    // Baixar vídeos em lotes paralelos (5 por vez)
+    const downloadedVideos = await processBatch(videos, 5);
+    
+    console.log('🔄 [ZIP] Criando arquivo ZIP...');
     const zip = new JSZip();
     
-    // Baixar e adicionar cada vídeo ao ZIP
-    for (let i = 0; i < videos.length; i++) {
-      const video = videos[i];
-      console.log(`📥 [ZIP] Baixando ${i + 1}/${videos.length}: ${video.filename}`);
-      
-      try {
-        const protocol = video.r2SignedUrl.startsWith('https') ? https : http;
-        
-        const response = await new Promise((resolve, reject) => {
-          protocol.get(video.r2SignedUrl, resolve).on('error', reject);
-        });
-        
-        if (response.statusCode !== 200) {
-          throw new Error(`HTTP ${response.statusCode}`);
-        }
-        
-        const chunks = [];
-        for await (const chunk of response) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        // Adicionar ao ZIP com nome limpo
-        const cleanFilename = video.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-        zip.file(cleanFilename, buffer);
-        
-        console.log(`✅ [ZIP] Adicionado: ${cleanFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
-      } catch (downloadError) {
-        console.error(`❌ [ZIP] Erro ao baixar ${video.filename}:`, downloadError);
-        throw new Error(`Falha ao baixar vídeo: ${video.filename}`);
-      }
-    }
+    // Adicionar todos os vídeos ao ZIP
+    downloadedVideos.forEach(({ filename, buffer }) => {
+      zip.file(filename, buffer);
+    });
 
-    console.log('🔄 [ZIP] Gerando arquivo ZIP...');
+    // Gerar ZIP SEM COMPRESSÃO (muito mais rápido)
+    console.log('🔄 [ZIP] Gerando ZIP sem compressão...');
     const zipBuffer = await zip.generateAsync({
       type: 'nodebuffer',
-      compression: 'DEFLATE',
-      compressionOptions: { level: 6 }
+      compression: 'STORE', // SEM compressão = máxima velocidade
+      streamFiles: false
     });
 
     const zipSizeBytes = zipBuffer.length;
-    console.log(`✅ [ZIP] ZIP gerado: ${(zipSizeBytes / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`✅ [ZIP] ZIP gerado: ${(zipSizeBytes / 1024 / 1024).toFixed(2)} MB em ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
 
     // Upload para R2
     const zipFilename = `${productCode}_${projectId}_${Date.now()}.zip`;
