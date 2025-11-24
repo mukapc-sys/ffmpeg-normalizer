@@ -143,21 +143,36 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
 
     console.log(`🎬 Comprimindo vídeo de URL: ${videoUrl.substring(0, 100)}...`);
 
-    // Download do vídeo
+    // Download do vídeo usando streaming para economizar memória
     inputPath = path.join('/tmp', `input_${Date.now()}.mp4`);
     outputPath = path.join('/tmp', `compressed_${Date.now()}.mp4`);
 
-    console.log('📥 Baixando vídeo...');
-    await execAsync(`curl -L -o "${inputPath}" "${videoUrl}"`, { maxBuffer: 500 * 1024 * 1024 });
+    console.log('📥 Baixando vídeo via streaming...');
+    
+    // Usar fetch com streaming para não crashar com vídeos grandes
+    const response = await fetch(videoUrl);
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+    }
+
+    // Criar write stream e aguardar download
+    const fileStream = require('fs').createWriteStream(inputPath);
+    await new Promise((resolve, reject) => {
+      response.body.pipe(fileStream);
+      response.body.on('error', reject);
+      fileStream.on('finish', resolve);
+      fileStream.on('error', reject);
+    });
 
     const inputStats = await fs.stat(inputPath);
     const originalSize = inputStats.size;
     console.log(`✅ Download completo: ${(originalSize / 1024 / 1024).toFixed(2)}MB`);
 
-    // Comprimir com CRF 23 (alta qualidade)
+    // Comprimir com CRF 23 (alta qualidade) mantendo resolução
     const compressionCrf = crf || 23;
     const compressionPreset = preset || 'medium';
 
+    // Não redimensionar, apenas comprimir mantendo qualidade visual
     const ffmpegCmd = `ffmpeg -i "${inputPath}" \
       -c:v libx264 -preset ${compressionPreset} -crf ${compressionCrf} \
       -maxrate 5M -bufsize 10M \
@@ -228,13 +243,16 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
     console.error('❌ Erro na compressão:', error);
     res.status(500).json({
       error: 'Compression failed',
-      message: error.message
+      message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   } finally {
     try {
       if (inputPath) await fs.unlink(inputPath).catch(() => {});
       if (outputPath) await fs.unlink(outputPath).catch(() => {});
-    } catch (e) {}
+    } catch (e) {
+      console.error('Erro ao limpar arquivos temporários:', e);
+    }
   }
 });
 
@@ -245,7 +263,8 @@ setInterval(async () => {
     const maxAge = 60 * 60 * 1000;
 
     for (const file of tmpFiles) {
-      if (file.startsWith('normalized_') || file.startsWith('upload_')) {
+      if (file.startsWith('normalized_') || file.startsWith('upload_') || 
+          file.startsWith('input_') || file.startsWith('compressed_')) {
         const filePath = path.join('/tmp', file);
         const stats = await fs.stat(filePath);
         if (now - stats.mtimeMs > maxAge) {
@@ -254,7 +273,9 @@ setInterval(async () => {
         }
       }
     }
-  } catch (error) {}
+  } catch (error) {
+    console.error('Erro na limpeza de arquivos:', error);
+  }
 }, 30 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
