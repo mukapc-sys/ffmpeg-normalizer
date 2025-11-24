@@ -401,19 +401,20 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
 
     const crypto = require('crypto');
     
-    // Gerar signed URL para R2
+    // Gerar signed URL para R2 (formato correto: accountId.r2.cloudflarestorage.com/bucket/path)
     const region = 'auto';
     const service = 's3';
-    const host = `${r2Config.bucketName}.${r2Config.accountId}.r2.cloudflarestorage.com`;
+    const bucket = r2Config.bucketName;
+    const host = `${r2Config.accountId}.r2.cloudflarestorage.com`;
     const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
     const dateStamp = amzDate.slice(0, 8);
     
-    const canonicalUri = `/${r2Path}`;
-    const canonicalHeaders = `host:${host}\nx-amz-date:${amzDate}\n`;
-    const signedHeaders = 'host;x-amz-date';
-    const payloadHash = 'UNSIGNED-PAYLOAD';
+    // Path deve incluir bucket: /bucket/path
+    const canonicalUri = `/${bucket}/${r2Path}`;
+    const credential = `${r2Config.accessKeyId}/${dateStamp}/${region}/${service}/aws4_request`;
+    const queryParams = `X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=${encodeURIComponent(credential)}&X-Amz-Date=${amzDate}&X-Amz-Expires=3600&X-Amz-SignedHeaders=host`;
     
-    const canonicalRequest = `PUT\n${canonicalUri}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+    const canonicalRequest = `PUT\n${canonicalUri}\n${queryParams}\nhost:${host}\n\nhost\nUNSIGNED-PAYLOAD`;
     const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
     const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${crypto.createHash('sha256').update(canonicalRequest).digest('hex')}`;
     
@@ -423,7 +424,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
     const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
     
-    const uploadUrl = `https://${host}${canonicalUri}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=${r2Config.accessKeyId}%2F${dateStamp}%2F${region}%2F${service}%2Faws4_request&X-Amz-Date=${amzDate}&X-Amz-Expires=3600&X-Amz-SignedHeaders=${signedHeaders}&X-Amz-Signature=${signature}`;
+    const uploadUrl = `https://${host}${canonicalUri}?${queryParams}&X-Amz-Signature=${signature}`;
 
     // Upload usando https nativo
     await new Promise((resolve, reject) => {
@@ -451,7 +452,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
       req.end();
     });
 
-    const publicUrl = `https://pub-93cb8cc35ae64cf69f0ea243148ad1b2.r2.dev/${r2Path}`;
+    const publicUrl = `https://pub-93cb8cc35ae64cf69f0ea243148ad1b2.r2.dev/${bucket}/${r2Path}`;
     console.log(`✅ [ZIP] Upload completo: ${publicUrl}`);
 
     // Notificar via webhook
