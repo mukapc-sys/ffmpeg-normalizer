@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
-const fetch = require('node-fetch');
+const https = require('https');
+const http = require('http');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs').promises;
@@ -149,19 +150,31 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
 
     console.log('📥 Baixando vídeo via streaming...');
     
-    // Usar fetch com streaming para não crashar com vídeos grandes
-    const response = await fetch(videoUrl);
-    if (!response.ok) {
-      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
-    }
-
-    // Criar write stream e aguardar download
-    const fileStream = require('fs').createWriteStream(inputPath);
+    // Download usando https nativo (sem dependências)
     await new Promise((resolve, reject) => {
-      response.body.pipe(fileStream);
-      response.body.on('error', reject);
-      fileStream.on('finish', resolve);
-      fileStream.on('error', reject);
+      const fileStream = require('fs').createWriteStream(inputPath);
+      const protocol = videoUrl.startsWith('https') ? https : http;
+      
+      protocol.get(videoUrl, (response) => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed: ${response.statusCode}`));
+          return;
+        }
+        
+        response.pipe(fileStream);
+        fileStream.on('finish', () => {
+          fileStream.close();
+          resolve();
+        });
+      }).on('error', (err) => {
+        fs.unlink(inputPath).catch(() => {});
+        reject(err);
+      });
+      
+      fileStream.on('error', (err) => {
+        fs.unlink(inputPath).catch(() => {});
+        reject(err);
+      });
     });
 
     const inputStats = await fs.stat(inputPath);
@@ -196,20 +209,38 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
       const compressedVideo = await fs.readFile(outputPath);
       
       const uploadUrl = `${supabaseUrl}/storage/v1/object/videos/${targetOutputPath}`;
-      const uploadResponse = await fetch(uploadUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${supabaseKey}`,
-          'Content-Type': 'video/mp4',
-          'x-upsert': 'true'
-        },
-        body: compressedVideo
+      
+      // Upload usando https nativo
+      await new Promise((resolve, reject) => {
+        const url = new URL(uploadUrl);
+        const options = {
+          method: 'POST',
+          hostname: url.hostname,
+          path: url.pathname,
+          headers: {
+            'Authorization': `Bearer ${supabaseKey}`,
+            'Content-Type': 'video/mp4',
+            'Content-Length': compressedVideo.length,
+            'x-upsert': 'true'
+          }
+        };
+        
+        const req = https.request(options, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve();
+            } else {
+              reject(new Error(`Upload failed: ${res.statusCode} - ${data}`));
+            }
+          });
+        });
+        
+        req.on('error', reject);
+        req.write(compressedVideo);
+        req.end();
       });
-
-      if (!uploadResponse.ok) {
-        const errorText = await uploadResponse.text();
-        throw new Error(`Upload failed: ${uploadResponse.status} - ${errorText}`);
-      }
 
       console.log('✅ Upload completo');
 
