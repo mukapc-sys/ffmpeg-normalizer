@@ -371,6 +371,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     console.log('📦 [ZIP] Iniciando geração de ZIP');
     
     const { 
+      jobId,
       projectId, 
       userId, 
       videos = [], 
@@ -383,7 +384,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
       return res.status(400).json({ error: 'Nenhum vídeo fornecido' });
     }
 
-    console.log(`📦 [ZIP] Projeto: ${projectId}, Vídeos: ${videos.length}`);
+    console.log(`📦 [ZIP] Projeto: ${projectId}, Job: ${jobId}, Vídeos: ${videos.length}`);
 
     // Baixar vídeos em paralelo (batches de 5)
     const downloadResults = await processBatch(videos, 5);
@@ -543,6 +544,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
       try {
         const webhookUrl = new URL(notificationWebhook);
         const notificationPayload = JSON.stringify({
+          jobId,
           projectId,
           userId,
           zipPath: r2Path,
@@ -619,6 +621,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            jobId: req.body.jobId,
             projectId: req.body.projectId,
             userId: req.body.userId,
             error: error.message
