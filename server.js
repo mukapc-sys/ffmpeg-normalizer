@@ -291,23 +291,50 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
 // ENDPOINT: /generate-zip
 // ============================================
 
-// Helper: Download video with timeout
-async function downloadVideoWithTimeout(url, timeoutMs = 60000) {
+// Helper: Download video with timeout (usando https.request para maior confiabilidade)
+async function downloadVideoWithTimeout(url, timeoutMs = 300000) { // 5 minutos para vídeos grandes
   return new Promise((resolve, reject) => {
-    const protocol = url.startsWith('https') ? https : http;
-    const timer = setTimeout(() => reject(new Error('Download timeout')), timeoutMs);
+    const parsedUrl = new URL(url);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
     
-    protocol.get(url, (response) => {
-      clearTimeout(timer);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      timeout: timeoutMs,
+      // Configurações SSL/TLS mais permissivas para evitar EPROTO
+      rejectUnauthorized: false,
+      requestCert: false,
+      agent: false
+    };
+
+    const req = protocol.request(options, (response) => {
       if (response.statusCode !== 200) {
         return reject(new Error(`HTTP ${response.statusCode}`));
       }
       
       const chunks = [];
       response.on('data', chunk => chunks.push(chunk));
-      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('end', () => {
+        try {
+          resolve(Buffer.concat(chunks));
+        } catch (error) {
+          reject(new Error(`Erro ao concatenar buffer: ${error.message}`));
+        }
+      });
       response.on('error', reject);
-    }).on('error', reject);
+    });
+
+    req.on('error', (error) => {
+      reject(new Error(`Erro de rede: ${error.message}`));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Download timeout'));
+    });
+
+    req.end();
   });
 }
 
@@ -322,7 +349,7 @@ async function processBatch(videos, batchSize = 5) {
     const batchResults = await Promise.all(
       batch.map(async (video) => {
         try {
-          const buffer = await downloadVideoWithTimeout(video.r2SignedUrl, 60000);
+          const buffer = await downloadVideoWithTimeout(video.r2SignedUrl, 300000); // 5 minutos
           return { success: true, video, buffer };
         } catch (error) {
           console.error(`❌ [BATCH] Erro ao baixar ${video.filename}:`, error.message);
@@ -426,7 +453,7 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     
     const uploadUrl = `https://${host}${canonicalUri}?${queryParams}&X-Amz-Signature=${signature}`;
 
-    // Upload usando https nativo
+    // Upload usando https nativo com timeout e configurações SSL robustas
     await new Promise((resolve, reject) => {
       const url = new URL(uploadUrl);
       const options = {
@@ -436,18 +463,37 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
         headers: {
           'Content-Type': 'application/zip',
           'Content-Length': zipSizeBytes
-        }
+        },
+        timeout: 3600000, // 60 minutos timeout para upload de ZIPs grandes (até 6GB)
+        rejectUnauthorized: false,
+        requestCert: false,
+        agent: false
       };
       
       const req = https.request(options, (res) => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve();
-        } else {
-          reject(new Error(`Upload falhou: ${res.statusCode}`));
-        }
+        let responseData = '';
+        res.on('data', chunk => responseData += chunk);
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            console.log(`✅ [ZIP] Upload R2 sucesso: ${res.statusCode}`);
+            resolve();
+          } else {
+            console.error(`❌ [ZIP] Upload R2 falhou: ${res.statusCode}`, responseData);
+            reject(new Error(`Upload falhou: ${res.statusCode} - ${responseData}`));
+          }
+        });
       });
       
-      req.on('error', reject);
+      req.on('error', (error) => {
+        console.error('❌ [ZIP] Erro de rede no upload R2:', error);
+        reject(new Error(`Erro de rede no upload: ${error.message}`));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Timeout no upload para R2'));
+      });
+      
       req.write(zipBuffer);
       req.end();
     });
@@ -455,32 +501,61 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     const publicUrl = `https://pub-93cb8cc35ae64cf69f0ea243148ad1b2.r2.dev/${bucket}/${r2Path}`;
     console.log(`✅ [ZIP] Upload completo: ${publicUrl}`);
 
-    // Notificar via webhook
+    // Notificar via webhook usando https nativo (mais confiável que fetch)
     if (notificationWebhook) {
       console.log('📧 [ZIP] Enviando notificação...');
       console.log('📧 [ZIP] Webhook URL:', notificationWebhook);
       try {
-        const notifyResponse = await fetch(notificationWebhook, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            projectId,
-            userId,
-            zipPath: r2Path,
-            zipPublicUrl: publicUrl,
-            zipSizeBytes,
-            videosCount: successfulDownloads.length,
-            processingTimeMs: Date.now() - startTime
-          })
+        const webhookUrl = new URL(notificationWebhook);
+        const notificationPayload = JSON.stringify({
+          projectId,
+          userId,
+          zipPath: r2Path,
+          zipPublicUrl: publicUrl,
+          zipSizeBytes,
+          videosCount: successfulDownloads.length,
+          processingTimeMs: Date.now() - startTime
         });
-        
-        if (!notifyResponse.ok) {
-          const errorText = await notifyResponse.text();
-          console.error('❌ [ZIP] Notificação falhou:', notifyResponse.status, errorText);
-        } else {
-          const notifyData = await notifyResponse.json();
-          console.log('✅ [ZIP] Notificação enviada com sucesso:', notifyData);
-        }
+
+        await new Promise((resolve, reject) => {
+          const options = {
+            hostname: webhookUrl.hostname,
+            path: webhookUrl.pathname,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(notificationPayload)
+            },
+            timeout: 10000 // 10s timeout
+          };
+
+          const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                console.log('✅ [ZIP] Notificação enviada com sucesso:', data);
+                resolve();
+              } else {
+                console.error('❌ [ZIP] Notificação falhou:', res.statusCode, data);
+                reject(new Error(`Status ${res.statusCode}: ${data}`));
+              }
+            });
+          });
+
+          req.on('error', (error) => {
+            console.error('❌ [ZIP] Erro de rede ao notificar:', error);
+            reject(error);
+          });
+
+          req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Timeout ao enviar notificação'));
+          });
+
+          req.write(notificationPayload);
+          req.end();
+        });
       } catch (notifyError) {
         console.error('❌ [ZIP] Erro ao notificar:', notifyError.message);
       }
