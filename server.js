@@ -453,50 +453,85 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     
     const uploadUrl = `https://${host}${canonicalUri}?${queryParams}&X-Amz-Signature=${signature}`;
 
-    // Upload usando https nativo com timeout e configurações SSL robustas
-    await new Promise((resolve, reject) => {
-      const url = new URL(uploadUrl);
-      const options = {
-        method: 'PUT',
-        hostname: url.hostname,
-        path: url.pathname + url.search,
-        headers: {
-          'Content-Type': 'application/zip',
-          'Content-Length': zipSizeBytes
-        },
-        timeout: 3600000, // 60 minutos timeout para upload de ZIPs grandes (até 6GB)
-        rejectUnauthorized: false,
-        requestCert: false,
-        agent: false
-      };
-      
-      const req = https.request(options, (res) => {
-        let responseData = '';
-        res.on('data', chunk => responseData += chunk);
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            console.log(`✅ [ZIP] Upload R2 sucesso: ${res.statusCode}`);
-            resolve();
-          } else {
-            console.error(`❌ [ZIP] Upload R2 falhou: ${res.statusCode}`, responseData);
-            reject(new Error(`Upload falhou: ${res.statusCode} - ${responseData}`));
-          }
-        });
-      });
-      
-      req.on('error', (error) => {
-        console.error('❌ [ZIP] Erro de rede no upload R2:', error);
-        reject(new Error(`Erro de rede no upload: ${error.message}`));
-      });
+    // Upload usando https nativo com chunked upload e retry para arquivos grandes
+    const uploadToR2WithRetry = async (attempt = 1) => {
+      const maxRetries = 3;
+      try {
+        await new Promise((resolve, reject) => {
+          const url = new URL(uploadUrl);
+          const options = {
+            method: 'PUT',
+            hostname: url.hostname,
+            path: url.pathname + url.search,
+            headers: {
+              'Content-Type': 'application/zip',
+              'Content-Length': zipSizeBytes
+            },
+            timeout: 3600000, // 60 minutos
+            rejectUnauthorized: false,
+            requestCert: false,
+            agent: false
+          };
+          
+          const req = https.request(options, (res) => {
+            let responseData = '';
+            res.on('data', chunk => responseData += chunk);
+            res.on('end', () => {
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                console.log(`✅ [ZIP] Upload R2 sucesso: ${res.statusCode}`);
+                resolve();
+              } else {
+                console.error(`❌ [ZIP] Upload R2 falhou: ${res.statusCode}`, responseData);
+                reject(new Error(`Upload falhou: ${res.statusCode} - ${responseData}`));
+              }
+            });
+          });
+          
+          req.on('error', (error) => {
+            console.error(`❌ [ZIP] Erro de rede no upload R2 (tentativa ${attempt}/${maxRetries}):`, error);
+            reject(error);
+          });
 
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Timeout no upload para R2'));
-      });
-      
-      req.write(zipBuffer);
-      req.end();
-    });
+          req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Timeout no upload para R2'));
+          });
+          
+          // Enviar em chunks de 50MB para evitar problemas de memória/rede
+          const chunkSize = 50 * 1024 * 1024; // 50MB
+          let offset = 0;
+          
+          const writeNextChunk = () => {
+            if (offset >= zipBuffer.length) {
+              req.end();
+              return;
+            }
+            
+            const end = Math.min(offset + chunkSize, zipBuffer.length);
+            const chunk = zipBuffer.slice(offset, end);
+            const canContinue = req.write(chunk);
+            offset = end;
+            
+            if (canContinue) {
+              writeNextChunk();
+            } else {
+              req.once('drain', writeNextChunk);
+            }
+          };
+          
+          writeNextChunk();
+        });
+      } catch (error) {
+        if (attempt < maxRetries && (error.code === 'EPROTO' || error.code === 'ECONNRESET')) {
+          console.log(`🔄 [ZIP] Tentando novamente upload (${attempt + 1}/${maxRetries})...`);
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt)); // backoff exponencial
+          return uploadToR2WithRetry(attempt + 1);
+        }
+        throw error;
+      }
+    };
+
+    await uploadToR2WithRetry();
 
     const publicUrl = `https://pub-93cb8cc35ae64cf69f0ea243148ad1b2.r2.dev/${bucket}/${r2Path}`;
     console.log(`✅ [ZIP] Upload completo: ${publicUrl}`);
