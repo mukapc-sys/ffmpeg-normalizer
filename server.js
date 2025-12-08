@@ -121,22 +121,25 @@ app.post('/normalize', upload.single('video'), async (req, res) => {
       'X-Processing-Time': processingTime
     });
 
+    // Cleanup robusto - executa em end, error OU close (cliente desconectou)
+    const cleanup = async () => {
+      try {
+        if (inputPath) await fs.unlink(inputPath).catch(() => {});
+        if (outputPath) await fs.unlink(outputPath).catch(() => {});
+      } catch (e) {}
+    };
+
     const fileStream = fsSync.createReadStream(outputPath);
     fileStream.pipe(res);
 
-    fileStream.on('end', async () => {
-      try {
-        if (inputPath) await fs.unlink(inputPath).catch(() => {});
-        if (outputPath) await fs.unlink(outputPath).catch(() => {});
-      } catch (e) {}
-    });
-
+    fileStream.on('end', cleanup);
     fileStream.on('error', async (err) => {
       console.error('❌ Erro no stream:', err);
-      try {
-        if (inputPath) await fs.unlink(inputPath).catch(() => {});
-        if (outputPath) await fs.unlink(outputPath).catch(() => {});
-      } catch (e) {}
+      await cleanup();
+    });
+    res.on('close', async () => {
+      fileStream.destroy();
+      await cleanup();
     });
 
   } catch (error) {
@@ -243,12 +246,25 @@ app.post('/compress', express.json({ limit: '50mb' }), async (req, res) => {
         'X-Compression-Ratio': compressionRatio
       });
 
+      // Cleanup robusto - executa em end, error OU close (cliente desconectou)
+      const cleanup = async () => {
+        try {
+          if (inputPath) await fs.unlink(inputPath).catch(() => {});
+          if (outputPath) await fs.unlink(outputPath).catch(() => {});
+        } catch (e) {}
+      };
+
       const fileStream = fsSync.createReadStream(outputPath);
       fileStream.pipe(res);
 
-      fileStream.on('end', async () => {
-        await fs.unlink(inputPath).catch(() => {});
-        await fs.unlink(outputPath).catch(() => {});
+      fileStream.on('end', cleanup);
+      fileStream.on('error', async (err) => {
+        console.error('❌ Erro no stream compress:', err);
+        await cleanup();
+      });
+      res.on('close', async () => {
+        fileStream.destroy();
+        await cleanup();
       });
     }
 
@@ -356,7 +372,10 @@ async function uploadFileStream(uploadUrl, filePath, headers = {}) {
       });
     });
     
-    req.on('error', reject);
+    req.on('error', (err) => {
+      fileStream.destroy();
+      reject(err);
+    });
     req.on('timeout', () => {
       req.destroy();
       reject(new Error('Upload timeout'));
@@ -605,6 +624,7 @@ async function uploadZipToR2WithRetry(uploadUrl, zipPath, zipSizeBytes, attempt 
       });
       
       req.on('error', (error) => {
+        fileStream.destroy();
         console.error(`❌ [ZIP] Erro de rede no upload (tentativa ${attempt}/${maxRetries}):`, error.message);
         reject(error);
       });
