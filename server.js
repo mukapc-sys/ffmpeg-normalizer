@@ -482,10 +482,12 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     // FASE 3: Upload para R2 via streaming
     console.log('☁️ [ZIP] Fase 3: Upload para R2 via streaming...');
     
-    const zipFilename = `${productCode}_${projectId}_${Date.now()}.zip`;
+    // Sanitizar nome do arquivo para evitar problemas com caracteres especiais
+    const sanitizedProductCode = (productCode || 'PROJETO').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const zipFilename = `${sanitizedProductCode}_${projectId}_${Date.now()}.zip`;
     const r2Path = `zips/${userId}/${zipFilename}`;
     
-    // Gerar signed URL
+    // Gerar signed URL usando AWS v4
     const region = 'auto';
     const service = 's3';
     const bucket = r2Config.bucketName;
@@ -493,21 +495,37 @@ app.post('/generate-zip', express.json({ limit: '50mb' }), async (req, res) => {
     const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
     const dateStamp = amzDate.slice(0, 8);
     
+    // URI path - sem encoding para canonical request interno
     const canonicalUri = `/${bucket}/${r2Path}`;
-    const credential = `${r2Config.accessKeyId}/${dateStamp}/${region}/${service}/aws4_request`;
-    const queryParams = `X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=${encodeURIComponent(credential)}&X-Amz-Date=${amzDate}&X-Amz-Expires=3600&X-Amz-SignedHeaders=host`;
     
-    const canonicalRequest = `PUT\n${canonicalUri}\n${queryParams}\nhost:${host}\n\nhost\nUNSIGNED-PAYLOAD`;
+    // Credential e query params
+    const credential = `${r2Config.accessKeyId}/${dateStamp}/${region}/${service}/aws4_request`;
+    
+    // Query params DEVEM estar ordenados alfabeticamente para AWS v4
+    const sortedParams = [
+      ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+      ['X-Amz-Credential', credential],
+      ['X-Amz-Date', amzDate],
+      ['X-Amz-Expires', '3600'],
+      ['X-Amz-SignedHeaders', 'host']
+    ].sort((a, b) => a[0].localeCompare(b[0]));
+    
+    const queryString = sortedParams.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+    
+    // Canonical request para assinatura
+    const canonicalRequest = `PUT\n${canonicalUri}\n${queryString}\nhost:${host}\n\nhost\nUNSIGNED-PAYLOAD`;
     const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
     const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${crypto.createHash('sha256').update(canonicalRequest).digest('hex')}`;
     
+    // Derivar signing key
     const kDate = crypto.createHmac('sha256', `AWS4${r2Config.secretAccessKey}`).update(dateStamp).digest();
     const kRegion = crypto.createHmac('sha256', kDate).update(region).digest();
     const kService = crypto.createHmac('sha256', kRegion).update(service).digest();
     const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
     const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
     
-    const uploadUrl = `https://${host}${canonicalUri}?${queryParams}&X-Amz-Signature=${signature}`;
+    // URL final para upload - usar mesmo encoding da canonical request
+    const uploadUrl = `https://${host}${canonicalUri}?${queryString}&X-Amz-Signature=${signature}`;
 
     // STREAMING: Upload do arquivo ZIP via stream com retry
     await uploadZipToR2WithRetry(uploadUrl, zipPath, zipSizeBytes);
